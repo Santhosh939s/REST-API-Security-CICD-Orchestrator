@@ -1,0 +1,237 @@
+name: DevSecOps CI/CD Security Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  # =========================================================================
+  # JOB 1: Software Composition Analysis (SCA Gate)
+  # Identifies vulnerable dependencies in package.json using OWASP Dependency-Check
+  # =========================================================================
+  sca-gate:
+    name: "SCA Gate: OWASP Dependency-Check"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python for Security Gatekeeper
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Create Reports Directory
+        run: mkdir -p reports
+
+      - name: Run OWASP Dependency-Check (SCA)
+        uses: dependency-check/Dependency-Check_Action@main
+        id: depcheck
+        continue-on-error: true
+        with:
+          project: "REST API Security CI/CD Orchestrator"
+          path: "."
+          format: "JSON"
+          out: "reports"
+          args: >
+            --enableRetired
+            --scan package.json
+            --suppression ""
+
+      - name: Fallback SCA Audit (NPM Audit)
+        if: steps.depcheck.outcome != 'success' || !hashFiles('reports/dependency-check-report.json')
+        run: |
+          echo "[*] Generating supplementary SCA report using NPM Audit..."
+          npm audit --json > reports/dependency-check-report.json || true
+
+      - name: Enforce SCA Security Gate
+        id: sca_gate
+        run: |
+          echo "=========================================================="
+          echo "  Evaluating SCA Findings with security_gate.py"
+          echo "=========================================================="
+          python scripts/security_gate.py \
+            --file reports/dependency-check-report.json \
+            --tool auto \
+            --fail-on CRITICAL,HIGH \
+            --export-markdown reports/sca-summary.md
+          cat reports/sca-summary.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload SCA Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-security-reports
+          path: reports/
+          retention-days: 7
+
+  # =========================================================================
+  # JOB 2: Static Application Security Testing (SAST Gate)
+  # Scans Express.js source code with Semgrep for hardcoded secrets and code flaws
+  # =========================================================================
+  sast-gate:
+    name: "SAST Gate: Semgrep Code Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Semgrep
+        run: |
+          python -m pip install --upgrade pip
+          pip install semgrep
+
+      - name: Create Reports Directory
+        run: mkdir -p reports
+
+      - name: Execute Semgrep SAST Scan
+        run: |
+          echo "=========================================================="
+          echo "  Running Semgrep SAST (OWASP Top 10 + Secrets Rules)"
+          echo "=========================================================="
+          # Run with repository custom rules and standard rulesets; capture JSON output
+          semgrep scan \
+            --config .semgrep.yml \
+            --config "p/owasp-top-10" \
+            --config "p/secrets" \
+            --config "p/javascript" \
+            --json \
+            -o reports/semgrep-report.json || true
+
+      - name: Enforce SAST Security Gate
+        id: sast_gate
+        run: |
+          echo "=========================================================="
+          echo "  Evaluating SAST Findings with security_gate.py"
+          echo "=========================================================="
+          python scripts/security_gate.py \
+            --file reports/semgrep-report.json \
+            --tool semgrep \
+            --fail-on CRITICAL,HIGH \
+            --export-markdown reports/sast-summary.md
+          cat reports/sast-summary.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload SAST Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-security-reports
+          path: reports/semgrep-report.json
+          retention-days: 7
+
+  # =========================================================================
+  # JOB 3: Dynamic Application Security Testing (DAST Gate - Staging)
+  # Spins up Node.js API in background and executes OWASP ZAP baseline scan
+  # =========================================================================
+  dast-gate:
+    name: "DAST Gate: OWASP ZAP Staging Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js Runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Set up Python for Security Gatekeeper
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install API Dependencies
+        run: npm ci || npm install
+
+      - name: Create Reports Directory
+        run: |
+          mkdir -p reports
+          chmod 777 reports
+
+      - name: Spin Up Node.js Staging Service (Background Daemon)
+        run: |
+          echo "=========================================================="
+          echo "  Starting Express REST API on http://localhost:5000"
+          echo "=========================================================="
+          node server.js &
+          API_PID=$!
+          echo "API_PID=$API_PID" >> $GITHUB_ENV
+
+          # Liveness check loop
+          echo "[*] Probing API readiness at http://localhost:5000/health..."
+          READY=false
+          for i in {1..30}; do
+            if curl -s -f http://localhost:5000/health > /dev/null; then
+              echo "[+] API is live and responding!"
+              READY=true
+              break
+            fi
+            echo "Waiting for service... ($i/30)"
+            sleep 1
+          done
+
+          if [ "$READY" = false ]; then
+            echo "[!] API failed to boot within timeout."
+            exit 1
+          fi
+
+          # Seed mock user fixtures for DAST crawler fuzzing
+          echo "[*] Seeding test database fixtures..."
+          curl -s -X POST http://localhost:5000/api/seed
+
+      - name: Execute OWASP ZAP Baseline Scan (Containerized)
+        run: |
+          echo "=========================================================="
+          echo "  Running OWASP ZAP DAST Scan against Staging API"
+          echo "=========================================================="
+          # Run official ZAP Docker container in host network mode
+          docker run --rm --net=host \
+            -v $(pwd)/reports:/zap/wrk/:rw \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t http://localhost:5000 \
+              -J zap-report.json \
+              -r zap-report.html \
+              -I || true
+
+      - name: Terminate Background Staging API
+        if: always()
+        run: |
+          if [ -n "$API_PID" ]; then
+            echo "[*] Terminating staging API service (PID: $API_PID)..."
+            kill -9 $API_PID || true
+          fi
+
+      - name: Enforce DAST Security Gate
+        id: dast_gate
+        run: |
+          echo "=========================================================="
+          echo "  Evaluating DAST Findings with security_gate.py"
+          echo "=========================================================="
+          python scripts/security_gate.py \
+            --file reports/zap-report.json \
+            --tool zap \
+            --fail-on CRITICAL,HIGH \
+            --export-markdown reports/dast-summary.md
+          cat reports/dast-summary.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload DAST Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-security-reports
+          path: reports/
+          retention-days: 7

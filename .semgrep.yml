@@ -1,0 +1,57 @@
+rules:
+  # =========================================================================
+  # Rule 1: Detect Hardcoded Secrets (CWE-798 / OWASP A05:2021)
+  # =========================================================================
+  - id: devsecops-hardcoded-jwt-secret
+    languages: [javascript, typescript]
+    message: "CRITICAL: Hardcoded JWT secret string detected. Secrets must be loaded via secure environment variables or a secrets manager."
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-798"]
+      impact: HIGH
+      confidence: HIGH
+      owasp: ["A05:2021 - Security Misconfiguration"]
+    patterns:
+      - pattern-either:
+          - pattern: 'const $SECRET = "..."'
+          - pattern: 'let $SECRET = "..."'
+          - pattern: 'var $SECRET = "..."'
+      - metavariable-regex:
+          metavariable: $SECRET
+          regex: '(?i).*(jwt|secret|key|token|auth).*'
+      - pattern-not: 'const $SECRET = process.env.$ENV_VAR'
+
+  # =========================================================================
+  # Rule 2: Detect NoSQL Injection in MongoDB / Mongoose queries (CWE-943)
+  # =========================================================================
+  - id: devsecops-nosql-injection
+    languages: [javascript, typescript]
+    message: "HIGH: User-controlled request body passed directly to Mongoose query selector without type validation or sanitization, enabling authentication bypass."
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-943"]
+      impact: HIGH
+      confidence: HIGH
+      owasp: ["A03:2021 - Injection", "API8:2023 - Security Misconfiguration"]
+    patterns:
+      - pattern-either:
+          - pattern: '$MODEL.findOne({ email: req.body.$EMAIL, password: req.body.$PWD })'
+          - pattern: '$MODEL.findOne(req.body)'
+          - pattern: '$MODEL.find(req.body)'
+
+  # =========================================================================
+  # Rule 3: Detect Broken Object Level Authorization / BOLA (CWE-639 / API1:2023)
+  # =========================================================================
+  - id: devsecops-bola-idor-unvalidated-id
+    languages: [javascript, typescript]
+    message: "HIGH: Resource lookup performed directly using route parameter ID (req.params.id) without verifying requester ownership or tenant context."
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-639"]
+      impact: HIGH
+      confidence: HIGH
+      owasp: ["API1:2023 - Broken Object Level Authorization", "A01:2021 - Broken Access Control"]
+    patterns:
+      - pattern-either:
+          - pattern: '$MODEL.findById(req.params.id)'
+          - pattern: '$MODEL.findByIdAndUpdate(req.params.id, ...)'

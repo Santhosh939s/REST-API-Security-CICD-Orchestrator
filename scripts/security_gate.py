@@ -211,6 +211,41 @@ class DependencyCheckParser(BaseSecurityParser):
         return findings
 
 
+class NpmAuditParser(BaseSecurityParser):
+    """Parses npm audit --json SCA reports."""
+
+    def parse(self) -> List[VulnerabilityFinding]:
+        findings: List[VulnerabilityFinding] = []
+        vulns = self.data.get("vulnerabilities", {})
+        for pkg, info in vulns.items():
+            severity = info.get("severity", "MEDIUM").upper()
+            via = info.get("via", [])
+            title = "Vulnerable package dependency"
+            cwe = None
+            url = None
+            if via and isinstance(via, list) and len(via) > 0 and isinstance(via[0], dict):
+                title = via[0].get("title", title)
+                cwe_raw = via[0].get("cwe")
+                if isinstance(cwe_raw, list) and cwe_raw:
+                    cwe = cwe_raw[0]
+                elif isinstance(cwe_raw, str):
+                    cwe = cwe_raw
+                url = via[0].get("url")
+
+            findings.append(
+                VulnerabilityFinding(
+                    tool="NPM Audit (SCA)",
+                    rule_id=f"NPM-{pkg}",
+                    title=f"{pkg}: {title}",
+                    severity=severity,
+                    location=pkg,
+                    description=url or title,
+                    cwe=cwe
+                )
+            )
+        return findings
+
+
 class SecurityGateOrchestrator:
     """Core evaluation engine that applies enterprise policy thresholds to security findings."""
 
@@ -225,10 +260,12 @@ class SecurityGateOrchestrator:
         """Autodetects the scanning tool based on characteristic JSON keys."""
         if "results" in data and ("semgrep" in str(data.get("version", "")).lower() or "paths" in data):
             return "semgrep"
-        if "site" in data or "@version" in data and "site" in data:
+        if "site" in data or ("@version" in data and "site" in data):
             return "zap"
         if "dependencies" in data and "reportSchema" in data:
             return "dependency-check"
+        if "auditReportVersion" in data or ("vulnerabilities" in data and "metadata" in data):
+            return "npm-audit"
         # Fallback inspection
         if "results" in data:
             return "semgrep"
@@ -236,6 +273,8 @@ class SecurityGateOrchestrator:
             return "zap"
         if "dependencies" in data:
             return "dependency-check"
+        if "vulnerabilities" in data:
+            return "npm-audit"
         return "unknown"
 
     def get_parser(self, tool_type: str, data: Dict[str, Any]) -> BaseSecurityParser:
@@ -245,8 +284,10 @@ class SecurityGateOrchestrator:
             return ZapParser(data)
         elif tool_type == "dependency-check":
             return DependencyCheckParser(data)
+        elif tool_type == "npm-audit":
+            return NpmAuditParser(data)
         else:
-            raise ValueError(f"Unsupported tool type '{tool_type}'. Supported tools: semgrep, zap, dependency-check")
+            raise ValueError(f"Unsupported tool type '{tool_type}'. Supported tools: semgrep, zap, dependency-check, npm-audit")
 
     def evaluate(self, findings: List[VulnerabilityFinding]) -> Dict[str, Any]:
         """Categorizes findings and computes gate pass/fail outcome."""
@@ -338,7 +379,7 @@ def main():
     )
     parser.add_argument(
         "--tool", "-t",
-        choices=["semgrep", "zap", "dependency-check", "auto"],
+        choices=["semgrep", "zap", "dependency-check", "npm-audit", "auto"],
         default="auto",
         help="Scanner type. Default is 'auto' (inspects JSON schema structure)."
     )
@@ -359,12 +400,19 @@ def main():
         print(f"[!] Error: Target report file '{args.file}' was not found.", file=sys.stderr)
         sys.exit(2)
 
-    # 2. Parse JSON Content
-    try:
-        with open(args.file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except json.JSONDecodeError as err:
-        print(f"[!] Error: Failed to parse JSON in '{args.file}': {err}", file=sys.stderr)
+    # 2. Parse JSON Content with encoding fallback (handles UTF-8, UTF-8-BOM, UTF-16 from PowerShell redirects)
+    data = None
+    parse_errors = []
+    for enc in ["utf-8", "utf-8-sig", "utf-16", "latin-1"]:
+        try:
+            with open(args.file, "r", encoding=enc) as f:
+                data = json.load(f)
+                break
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            parse_errors.append(f"{enc}: {e}")
+
+    if data is None:
+        print(f"[!] Error: Failed to parse JSON from '{args.file}'. Errors: {'; '.join(parse_errors)}", file=sys.stderr)
         sys.exit(2)
 
     # 3. Detect Tool Type
